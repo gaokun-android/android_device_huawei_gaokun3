@@ -81,14 +81,20 @@ PRODUCT_PACKAGES += \
 PRODUCT_PACKAGES += \
     com.android.hardware.audio
 
-# thermal HAL 同样是 installable:false 的 APEX 打包件：
-#   hardware/interfaces/thermal/aidl/default/Android.bp 的 cc_binary
-#   android.hardware.thermal-service.example 带 installable: false，
-#   binary 只出现在 apex "com.android.hardware.thermal" 里。
-# 2026-08-19 实测：直接列 binary 名会让 kati 报
-#   "includes non-existent modules in PRODUCT_PACKAGES" 并中止构建。
+# ═══ 温控 HAL：2026-08-24 换成自研的真 HAL ═══
+# 原先装的是 AOSP mock（apex com.android.hardware.thermal，里面那个
+# android.hardware.thermal-service.example 是 installable:false 的，
+# 所以当年只能列 APEX 名 —— 直接列 binary 名 kati 会报
+# "includes non-existent modules in PRODUCT_PACKAGES" 并中止构建）。
+#
+# ⚠️★★ 换掉它是【有危险】的一步，务必连阈值一起改：mock 报的 skin/battery
+#   SHUTDOWN 阈值只有 36.0 °C，而 ThermalManagerService.shutdownIfNeeded()
+#   一到 SHUTDOWN 就 powerManager.shutdown()。本机温区【空载就 36–37 °C】——
+#   只换 HAL 不改阈值 = 开机几分钟自动关机。新阈值与理由见 thermal/Thermal.cpp。
+# ★ 排除 mock 的办法只能是【不装那个 APEX】：overrides: 管不到 APEX 打包件，
+#   而 PRODUCT_PACKAGES 只能加不能减 —— 所以这里是把那一行整个换掉。
 PRODUCT_PACKAGES += \
-    com.android.hardware.thermal
+    android.hardware.thermal-service.gaokun3
 
 # effects HAL 启动即退（"config file audio_effects_config.xml not found"，
 # 实测）。默认配置的 prebuilt_etc 被 soong config 门控着
@@ -188,8 +194,23 @@ PRODUCT_COPY_FILES += \
 
 PRODUCT_COPY_FILES += \
     frameworks/native/data/etc/android.hardware.opengles.aep.xml:$(TARGET_COPY_OUT_VENDOR)/etc/permissions/android.hardware.opengles.aep.xml \
-    frameworks/native/data/etc/android.hardware.vulkan.level-1.xml:$(TARGET_COPY_OUT_VENDOR)/etc/permissions/android.hardware.vulkan.level.xml \
-    frameworks/native/data/etc/android.hardware.vulkan.version-1_1.xml:$(TARGET_COPY_OUT_VENDOR)/etc/permissions/android.hardware.vulkan.version.xml
+    frameworks/native/data/etc/android.hardware.vulkan.level-1.xml:$(TARGET_COPY_OUT_VENDOR)/etc/permissions/android.hardware.vulkan.level.xml
+
+# ★ Vulkan 1.3（2026-08-24 从 1.1 提上来）。依据是 turnip 自己的代码，不是估计：
+#   mesa 26.0 src/freedreno/vulkan/tu_device.cc:1190
+#       props->apiVersion = tu_has_multiview(pdevice)
+#           ? ((chip >= 7) ? TU_API_VERSION : VK_MAKE_VERSION(1, 3, ...))
+#           : VK_MAKE_VERSION(1, 0, ...);
+#   Adreno 690 是 a6xx（chip 6）⇒ 走 1.3 那一支；而 tu_has_multiview() 取的是
+#   props.has_hw_multiview，freedreno_devices.py 里 a690 = [a6xx_base, a6xx_gen4]，
+#   而 a6xx_base 的 has_hw_multiview = True（False 的是 A702 那一档）。
+#   ⇒ turnip 在本机实报 1.3，声明 1.3 是照实写，不是往高了报。
+# ⚠️ 不声明 android.software.vulkan.deqp.level —— 那要跑 dEQP 才能背书，我们没跑。
+# ★ 顺带补上 compute：Vulkan 1.1+ 的核心里就有计算着色器，之前只声明了
+#   level 与 version，缺 compute 在真机上是不常见的组合。
+PRODUCT_COPY_FILES += \
+    frameworks/native/data/etc/android.hardware.vulkan.compute-0.xml:$(TARGET_COPY_OUT_VENDOR)/etc/permissions/android.hardware.vulkan.compute.xml \
+    frameworks/native/data/etc/android.hardware.vulkan.version-1_3.xml:$(TARGET_COPY_OUT_VENDOR)/etc/permissions/android.hardware.vulkan.version.xml
 
 #
 # Stage 3 之后再加（每次只加一个）：
@@ -199,9 +220,20 @@ PRODUCT_COPY_FILES += \
 #
 
 # ─── Stage 4: WiFi（ath11k 主线 + AIDL HAL APEX + wpa_supplicant）───
+# ★ wpa_cli：诊断用的控制台客户端。之前没装，于是 WPA3（issue #2）
+#   最直接的那条验证路——问 supplicant 自己 sae_pwe / 支持哪些 key_mgmt
+#   ——在设备上根本跑不了，而 wpa_supplicant.rc 明明开着控制接口。
+#   模块名已核：external/wpa_supplicant_8/wpa_supplicant/Android.bp:1272
+#   是 cc_binary + proprietary:true ⇒ 装到 /vendor/bin/wpa_cli，
+#   依赖只有 libcutils/liblog（Soong 自己拉 vendor 变体，
+#   不会重演 tinymix 那个 "放进 /vendor/bin 但 .so 在 /system" 的坑）。
+#   ⚙ 用法：wpa_cli -p /data/vendor/wifi/wpa/sockets -i wlan0 <cmd>
+#   ⚠ 那个目录是 0770 wifi:wifi（见 wifi/wpa_supplicant.rc），
+#     shell 不在 wifi 组里 ⇒ 要 root 才能连上。
 PRODUCT_PACKAGES += \
     com.android.hardware.wifi \
-    wpa_supplicant
+    wpa_supplicant \
+    wpa_cli
 
 PRODUCT_COPY_FILES += \
     $(LOCAL_PATH)/wifi/wpa_supplicant.rc:$(TARGET_COPY_OUT_VENDOR)/etc/init/wpa_supplicant.rc \
@@ -231,6 +263,40 @@ PRODUCT_SOONG_NAMESPACES += device/generic/goldfish
 PRODUCT_COPY_FILES += \
     $(LOCAL_PATH)/wifi/wpa_supplicant.conf:$(TARGET_COPY_OUT_VENDOR)/etc/wifi/wpa_supplicant.conf
 
+# ─── 相机 HAL（AIDL，基于 libcamera 的软件 ISP）───
+# 背景：三条便宜路都走不通，只能自己写 AIDL（docs/stage4-findings.md #91）：
+#   ❌ HIDL + 上游 provider@2.4-legacy —— 本机 hwservicemanager 根本不存在，
+#      且 FCM 202504 的兼容性矩阵里 camera.provider 只剩 format="aidl"
+#   ❌ libcamera 的 V4L2 垫片 + AOSP 的 ExternalCameraProvider —— 软件 ISP
+#      只出 RGB 族、没有 YUYV（和 #84 撞同一堵墙）
+# ✅ libcamera 现在在 AOSP 里编（external/libcamera，见 patches/libcamera/）。
+#   ⚠️ 仍欠一笔：那 5 个生成的 .cpp 与整批生成头要先跑一次 meson 产出再拷贝，
+#   是手动步骤（#82/#85 的形状）。正解是 Soong genrule 跑 libcamera 自带的
+#   Python 生成器。构建 ROM 前请确认 external/libcamera/generated/ 已就位。
+PRODUCT_PACKAGES += \
+    android.hardware.camera.provider-service.gaokun3 \
+    libcamera_gk3 \
+    libcamera_base_gk3 \
+    libcamera_ipa_softisp_gk3
+
+# ⚠️★★ 相机设备节点的权限**并进 ueventd.gaokun3.rc**，不要另开一个文件往
+#   /vendor/etc/ueventd.rc 拷 —— 那个目标只能有一份，另拷一份会把原有的
+#   GPU 渲染节点 / FastRPC 传感器 / Venus 三组规则全部覆盖掉。
+#   （我 2026-09-13 就是这么干的，在设备上把它们冲了；构建期会表现为
+#    PRODUCT_COPY_FILES 目标重复。）
+PRODUCT_COPY_FILES += \
+    $(LOCAL_PATH)/camera/gaokun3-camera-features.xml:$(TARGET_COPY_OUT_VENDOR)/etc/permissions/gaokun3-camera-features.xml \
+    $(LOCAL_PATH)/camera/ipa-data/softisp/hi846.yaml:$(TARGET_COPY_OUT_VENDOR)/etc/libcamera/ipa/softisp/hi846.yaml \
+    $(LOCAL_PATH)/camera/ipa-data/softisp/ov13b10.yaml:$(TARGET_COPY_OUT_VENDOR)/etc/libcamera/ipa/softisp/ov13b10.yaml \
+    $(LOCAL_PATH)/camera/ipa-data/softisp/uncalibrated.yaml:$(TARGET_COPY_OUT_VENDOR)/etc/libcamera/ipa/softisp/uncalibrated.yaml
+
+# ⚠️★ 软件 ISP 的 IPA 【必须】能读到调优文件，否则 IPASoftIsp::init() 直接返回
+#   错误 → "Failed to create software ISP, disabling software debayering"
+#   → libcamera 退回原始拜耳 → 我们要的 RGB888 不可用 → configure 被调整成
+#   SGBRG10_CSI2P/RAW → STREAMON 失败。整条因果链里**没有一处提到调优文件**。
+#   路径布局是 <IPA_CONFIG_DIR>/<ipa名>/<文件名>（libcamera ipa_proxy.cpp:57），
+#   而 IPA_CONFIG_DIR 由我们自己的 config.h 定成 /vendor/etc/libcamera/ipa。
+
 # ─── Stage 4: 蓝牙（WCN6855 / hci_qca，AOSP 原装 HAL 直接可用）───
 # ⚠️ 2026-08-19 发现：#34 记了"把这个 HAL 推进 vendor 即可"，但那句话
 #    从没变成一行构建配置 —— Stage 4 是走 adb remount 的 overlay 推的。
@@ -253,6 +319,42 @@ PRODUCT_PACKAGES += \
 PRODUCT_COPY_FILES += \
     frameworks/native/data/etc/android.hardware.bluetooth.xml:$(TARGET_COPY_OUT_VENDOR)/etc/permissions/android.hardware.bluetooth.xml \
     frameworks/native/data/etc/android.hardware.bluetooth_le.xml:$(TARGET_COPY_OUT_VENDOR)/etc/permissions/android.hardware.bluetooth_le.xml
+
+# ─── 蓝牙 profile 开关（用户报「耳机配得上、用不了」，2026-08-23）───
+# ★ 根因：AOSP 14 起每个 profile 由一条 sysprop 单独开关，而【不设 = 关闭】。
+#   packages/modules/Bluetooth/.../a2dp/A2dpService.java:
+#       public static boolean isEnabled() {
+#           return BluetoothProperties.isProfileA2dpSourceEnabled().orElse(false);
+#       }
+#   `.orElse(false)` 就是判决书。本机此前一条 bluetooth.* 属性都没有
+#   （实测 `getprop | grep -c "^\[bluetooth\."` = 0），于是只有 AdapterService
+#   在跑 —— 配对是 adapter 的活所以配得上，放音是 profile 的活所以没有。
+#
+# ★ 属性名取自 system/libsysprop/srcs/android/sysprop/BluetoothProperties.sysprop
+#   （android-16.0.0_r4），不是凭记忆写的。
+# ★ 集合参照 LineageOS android_device_essential_mata/vendor.prop，两处不同：
+#   · 去掉 sap.server —— SIM 卡访问，本机无 modem 无 SIM，开了没有意义
+#   · LE Audio 全家（bap/ccp/csip/hap/mcp/vcp/bass）暂不开 —— 半开的 LE Audio
+#     正是「连上了却没声」这一类故障的经典来源，等有设备能验再说
+#
+# 实测（运行期 setprop + 重启蓝牙，构建戳 1787436126）：
+#   设之前 `setProfileServiceState` 一条不出、A2dpService 不存在；
+#   设之后 12 个 profile 拉起，`btif_av.cc:3813 btif_av_source_execute_service:
+#   enable=true`。
+PRODUCT_VENDOR_PROPERTIES += \
+    bluetooth.profile.gatt.enabled=true \
+    bluetooth.profile.a2dp.source.enabled=true \
+    bluetooth.profile.avrcp.target.enabled=true \
+    bluetooth.profile.hfp.ag.enabled=true \
+    bluetooth.profile.hid.host.enabled=true \
+    bluetooth.profile.hid.device.enabled=true \
+    bluetooth.profile.bas.client.enabled=true \
+    bluetooth.profile.asha.central.enabled=true \
+    bluetooth.profile.opp.enabled=true \
+    bluetooth.profile.pan.nap.enabled=true \
+    bluetooth.profile.pan.panu.enabled=true \
+    bluetooth.profile.pbap.server.enabled=true \
+    bluetooth.profile.map.server.enabled=true
 
 # ─── Stage 4/5: 固件双路安装 ───
 # 新增固件（从本机 Ubuntu /lib/firmware 提取，华为专有，不入版本库）：
@@ -623,3 +725,23 @@ PRODUCT_PACKAGES += \
 PRODUCT_COPY_FILES += \
     $(LOCAL_PATH)/bin/gaokun3-keyboard.sh:$(TARGET_COPY_OUT_VENDOR)/bin/gaokun3-keyboard.sh \
     $(LOCAL_PATH)/etc/keyboard.rc:$(TARGET_COPY_OUT_VENDOR)/etc/init/keyboard.rc
+
+# ═══════════ 触摸手感模式（用户 2026-08-23 反馈手感不好）═══════════
+#
+# ★ 先说清楚一件事：我们内核里的 himax 驱动【就是】上游的 EGoTouchRev
+#   （github.com/chiyuki0325/EGoTouchRev-Linux）。逐项比对过：14 个算法函数
+#   逐字相同，20 项默认值只差一项，上游最新提交与 buildbot 那个补丁是同一天的。
+#   ⇒ 「换成 EGoTouchRev」换不来任何东西，我们已经在跑它了。
+#
+# 真正的差距在【参数】：驱动跑的是日用默认值，而它的调参工具里另有一套
+# game_preset，我们从来没用过。差三项，见 bin/gaokun3-touch-mode.sh。
+#
+# 默认设 game：本机的目标就是跑手游，而这三项只关掉平滑与按下防抖
+# （少 2 帧延迟），不动任何信号处理门限。切回来：
+#   setprop persist.sys.gaokun3.touch_mode daily
+PRODUCT_COPY_FILES += \
+    $(LOCAL_PATH)/bin/gaokun3-touch-mode.sh:$(TARGET_COPY_OUT_VENDOR)/bin/gaokun3-touch-mode.sh \
+    $(LOCAL_PATH)/etc/touchmode.rc:$(TARGET_COPY_OUT_VENDOR)/etc/init/touchmode.rc
+
+PRODUCT_VENDOR_PROPERTIES += \
+    persist.sys.gaokun3.touch_mode=game

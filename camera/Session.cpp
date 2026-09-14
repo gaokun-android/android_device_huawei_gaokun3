@@ -1,0 +1,1067 @@
+/* SPDX-License-Identifier: Apache-2.0 */
+/*
+ * gaokun3 相机 HAL —— 会话：流配置、请求、以及把 libcamera 的 RGB 帧
+ * 交付到 Android 的 gralloc 缓冲。
+ *
+ * ⚠️★ 设计上的一个硬约束：**软件 ISP 只输出 RGB 族**
+ *    （libcamera debayer_cpu.cpp:436-441 —— 没有 YUV/NV12/YUYV），
+ *    而 Android 要 YUV_420_888 / JPEG。色彩转换因此必须由本层用 libyuv 做。
+ *    这正是 AOSP 自带的 ExternalCameraProvider 接不上的原因（[#91]）。
+ */
+#include "Session.h"
+
+#include <algorithm>
+#include <cstdlib>
+#include <cstring>
+#include <fcntl.h>
+#include <thread>
+#include <unistd.h>
+
+#include <aidl/android/hardware/camera/common/Status.h>
+#include <aidl/android/hardware/camera/device/ConfigureStreamsRet.h>
+#include <aidl/android/hardware/camera/device/ErrorCode.h>
+#include <aidl/android/hardware/camera/device/ErrorMsg.h>
+#include <aidl/android/hardware/camera/device/ICameraDeviceCallback.h>
+#include <aidl/android/hardware/camera/device/ICameraOfflineSession.h>
+#include <aidl/android/hardware/camera/device/NotifyMsg.h>
+#include <aidl/android/hardware/camera/device/ShutterMsg.h>
+#include <aidl/android/hardware/camera/device/CameraBlob.h>
+#include <aidl/android/hardware/camera/device/CameraBlobId.h>
+#include <aidlcommonsupport/NativeHandle.h>
+#include <jpeglib.h>
+#include <hardware/gralloc.h>
+#include <libyuv.h>
+#include <log/log.h>
+#include <sys/mman.h>
+#include <system/graphics.h>
+#include <ui/GraphicBufferMapper.h>
+#include <ui/Rect.h>
+#include <utils/Errors.h>
+
+#include <libcamera/control_ids.h>
+#include <libcamera/formats.h>
+
+using ::aidl::android::hardware::camera::common::Status;
+using ::aidl::android::hardware::camera::device::BufferCache;
+using ::aidl::android::hardware::camera::device::BufferStatus;
+using ::aidl::android::hardware::camera::device::CameraBlob;
+using ::aidl::android::hardware::camera::device::CameraBlobId;
+using ::aidl::android::hardware::camera::device::CameraMetadata;
+using ::aidl::android::hardware::camera::device::CaptureRequest;
+using ::aidl::android::hardware::camera::device::CaptureResult;
+using ::aidl::android::hardware::camera::device::ErrorCode;
+using ::aidl::android::hardware::camera::device::ErrorMsg;
+using ::aidl::android::hardware::camera::device::HalStream;
+using ::aidl::android::hardware::camera::device::ICameraDeviceCallback;
+using ::aidl::android::hardware::camera::device::NotifyMsg;
+using ::aidl::android::hardware::camera::device::RequestTemplate;
+using ::aidl::android::hardware::camera::device::ShutterMsg;
+using ::aidl::android::hardware::camera::device::StreamBuffer;
+using ::aidl::android::hardware::camera::device::StreamConfiguration;
+
+namespace gaokun3 {
+
+namespace {
+ndk::ScopedAStatus err(Status s)
+{
+	return ndk::ScopedAStatus::fromServiceSpecificError(static_cast<int32_t>(s));
+}
+} /* namespace */
+
+Session::Session(std::shared_ptr<libcamera::Camera> cam, SensorFacts facts,
+		 std::shared_ptr<ICameraDeviceCallback> cb)
+	: flashLed_(facts.flashLed), cam_(std::move(cam)), facts_(std::move(facts)),
+	  cb_(std::move(cb))
+{
+	if (!flashLed_.empty()) {
+		char buf[32] = {};
+		int fd = open((flashLed_ + "/max_brightness").c_str(), O_RDONLY | O_CLOEXEC);
+		if (fd >= 0) {
+			ssize_t n = read(fd, buf, sizeof(buf) - 1);
+			::close(fd);   /* 不是 Session::close() */
+			if (n > 0) {
+				std::string v(buf, static_cast<size_t>(n));
+				while (!v.empty() && (v.back() == '\n' || v.back() == ' '))
+					v.pop_back();
+				if (!v.empty())
+					ledMax_ = v;
+			}
+		}
+	}
+}
+
+void Session::setLed(bool on)
+{
+	if (flashLed_.empty() || on == ledOn_)
+		return;
+	int fd = open((flashLed_ + "/brightness").c_str(), O_WRONLY | O_CLOEXEC);
+	if (fd < 0) {
+		ALOGE("闪光灯：打不开 %s/brightness: %s", flashLed_.c_str(), strerror(errno));
+		return;
+	}
+	const std::string v = on ? ledMax_ : "0";
+	if (write(fd, v.c_str(), v.size()) != static_cast<ssize_t>(v.size()))
+		ALOGE("闪光灯：写 brightness 失败: %s", strerror(errno));
+	else
+		ledOn_ = on;
+	::close(fd);
+}
+
+void Session::parseFlashControls(const std::vector<uint8_t> &settings, uint8_t *trigger,
+				 uint8_t *intent)
+{
+	/* 请求不带设置 = 与上一帧相同（CaptureRequest.aidl 的约定），粘滞值不动。 */
+	if (settings.empty())
+		return;
+	const camera_metadata_t *m =
+		reinterpret_cast<const camera_metadata_t *>(settings.data());
+	camera_metadata_ro_entry_t e;
+	if (find_camera_metadata_ro_entry(m, ANDROID_CONTROL_AE_MODE, &e) == 0 && e.count)
+		aeMode_ = e.data.u8[0];
+	if (find_camera_metadata_ro_entry(m, ANDROID_FLASH_MODE, &e) == 0 && e.count)
+		flashMode_ = e.data.u8[0];
+	if (trigger &&
+	    find_camera_metadata_ro_entry(m, ANDROID_CONTROL_AE_PRECAPTURE_TRIGGER, &e) == 0 &&
+	    e.count)
+		*trigger = e.data.u8[0];
+	if (intent &&
+	    find_camera_metadata_ro_entry(m, ANDROID_CONTROL_CAPTURE_INTENT, &e) == 0 && e.count)
+		*intent = e.data.u8[0];
+}
+
+Session::~Session()
+{
+	close();
+}
+
+bool Session::init()
+{
+	if (cam_->acquire()) {
+		ALOGE("libcamera Camera::acquire 失败（是不是已经被别人占了）");
+		return false;
+	}
+	cam_->requestCompleted.connect(this, &Session::onRequestCompleted);
+	/* 框架建会话时会取这两个描述符；我们不往里写（fmqResultSize 恒 0），
+	 * 但必须是有效的队列。大小照抄 AOSP 的 ExternalCameraDeviceSession。 */
+	requestQueue_ = std::make_shared<MetadataQueue>(1 << 20, false);
+	resultQueue_ = std::make_shared<MetadataQueue>(1 << 20, false);
+	if (!requestQueue_->isValid() || !resultQueue_->isValid()) {
+		ALOGE("建 FMQ 元数据队列失败");
+		return false;
+	}
+	return true;
+}
+
+ndk::ScopedAStatus Session::close()
+{
+	{
+		std::lock_guard<std::mutex> lk(mutex_);
+		if (closed_)
+			return ndk::ScopedAStatus::ok();
+		closed_ = true;
+
+		if (streaming_) {
+			cam_->stop();
+			streaming_ = false;
+		}
+		cam_->requestCompleted.disconnect(this, &Session::onRequestCompleted);
+		freeRequests_.clear();
+		pending_.clear();
+		dropAllCaches();
+		allocator_.reset();
+		config_.reset();
+		cam_->release();
+		setLed(false);   /* 会话结束灯必须灭，别让 torch 请求把灯留着 */
+		ALOGI("会话已关闭");
+	}
+	/* 在锁外通知 Device（它会拿自己的锁）。 */
+	if (onClosed_)
+		onClosed_();
+	return ndk::ScopedAStatus::ok();
+}
+
+ndk::ScopedAStatus Session::configureStreams(const StreamConfiguration &cfg,
+					     std::vector<HalStream> *out)
+{
+	std::lock_guard<std::mutex> lk(mutex_);
+	out->clear();
+
+	if (cfg.streams.empty())
+		return err(Status::ILLEGAL_ARGUMENT);
+
+	/*
+	 * ★ 相机应用一定会配多路（预览 + 拍照）。libcamera 只开【一路】，
+	 *   尺寸取各路里最大的那个，再用 libyuv 缩放分发 ——
+	 *   软件 ISP 是 CPU 瓶颈，开多路等于把同一份拜耳去马赛克多次。
+	 */
+	int32_t maxW = 0, maxH = 0;
+	for (const auto &s2 : cfg.streams) {
+		ALOGI("  请求流 id=%d %dx%d fmt=0x%x", s2.id, s2.width, s2.height,
+		      static_cast<int>(s2.format));
+		if (static_cast<int64_t>(s2.width) * s2.height >
+		    static_cast<int64_t>(maxW) * maxH) {
+			maxW = s2.width;
+			maxH = s2.height;
+		}
+	}
+
+	if (streaming_) {
+		cam_->stop();
+		streaming_ = false;
+		freeRequests_.clear();
+		pending_.clear();
+		allocator_.reset();
+	}
+
+	/* Viewfinder role 会启用软件 ISP（Raw role 不会）。 */
+	config_ = cam_->generateConfiguration({ libcamera::StreamRole::Viewfinder });
+	if (!config_ || config_->empty()) {
+		ALOGE("generateConfiguration 失败");
+		return err(Status::INTERNAL_ERROR);
+	}
+	libcamera::StreamConfiguration &sc = config_->at(0);
+	sc.size = libcamera::Size(maxW, maxH);
+	/* 固定要 RGB888。⚠️ 用 3 字节的 RGB888 而不是 4 字节的 ABGR8888：
+	 * 8 MP 下每帧少搬 8 MB，而软件去拜耳本来就是 CPU 瓶颈。 */
+	sc.pixelFormat = libcamera::formats::RGB888;
+	sc.bufferCount = 4;
+
+	libcamera::CameraConfiguration::Status st = config_->validate();
+	if (st == libcamera::CameraConfiguration::Invalid) {
+		ALOGE("配置无效");
+		return err(Status::ILLEGAL_ARGUMENT);
+	}
+	if (st == libcamera::CameraConfiguration::Adjusted)
+		ALOGW("配置被调整为 %s", sc.toString().c_str());
+
+	if (cam_->configure(config_.get())) {
+		ALOGE("Camera::configure 失败");
+		return err(Status::INTERNAL_ERROR);
+	}
+
+	stream_ = sc.stream();
+	srcWidth_ = sc.size.width;
+	srcHeight_ = sc.size.height;
+
+	allocator_ = std::make_unique<libcamera::FrameBufferAllocator>(cam_);
+	if (allocator_->allocate(stream_) < 0) {
+		ALOGE("分配 libcamera 缓冲失败");
+		return err(Status::INTERNAL_ERROR);
+	}
+	for (const auto &b : allocator_->buffers(stream_)) {
+		auto r = cam_->createRequest();
+		if (!r || r->addBuffer(stream_, b.get())) {
+			ALOGE("建 libcamera 请求失败");
+			return err(Status::INTERNAL_ERROR);
+		}
+		freeRequests_.push_back(std::move(r));
+	}
+
+	if (cam_->start()) {
+		ALOGE("Camera::start 失败");
+		return err(Status::INTERNAL_ERROR);
+	}
+	streaming_ = true;
+
+	halStreams_.clear();
+	for (const auto &s2 : cfg.streams) {
+		const bool isBlob =
+			s2.format == aidl::android::hardware::graphics::common::PixelFormat::BLOB;
+		/* ⚠️ BLOB 流的 bufferSize 由框架给（Stream::bufferSize）；
+		 *    它是【字节数】，不是像素宽高。 */
+		halStreams_.push_back({ s2.id, s2.width, s2.height, isBlob,
+					isBlob ? s2.bufferSize : 0 });
+
+		HalStream hs;
+		hs.id = s2.id;
+		/* IMPLEMENTATION_DEFINED 要由 HAL 定成具体格式；我们交付 YCbCr_420_888。 */
+		hs.overrideFormat =
+			(s2.format == aidl::android::hardware::graphics::common::PixelFormat::
+					      IMPLEMENTATION_DEFINED)
+				? aidl::android::hardware::graphics::common::PixelFormat::YCBCR_420_888
+				: s2.format;
+		hs.producerUsage =
+			aidl::android::hardware::graphics::common::BufferUsage::CPU_WRITE_OFTEN;
+		hs.consumerUsage =
+			static_cast<aidl::android::hardware::graphics::common::BufferUsage>(0);
+		hs.maxBuffers = 4;
+		hs.overrideDataSpace = s2.dataSpace;
+		hs.physicalCameraId = "";
+		hs.supportOffline = false;
+		hs.enableHalBufferManager = false;
+		out->push_back(hs);
+	}
+
+	/*
+	 * ★ 2026-09-14（#109）：libcamera 若没能建起软件 ISP（IPA 模块找不到、调优文件缺失……），
+	 *   simple 流水线会"disabling software debayering"，然后把【裸拜耳】当成配置结果交回来；
+	 *   下面的 deliver() 把它当 RGB24 喂 libyuv，越界读 ⇒ provider SIGSEGV 循环重启，
+	 *   应用只看到"无法连接相机"。v0.6.0 正式镜像就是这样死的（IPA 装错目录）。
+	 *   这里把它变成一条能读懂的错误。
+	 */
+	if (sc.pixelFormat != libcamera::formats::RGB888) {
+		ALOGE("libcamera 配置出来的不是 RGB888 而是 %s —— 软件 ISP 没建起来？"
+		      "看 libcamera.log 里有没有 'No IPA found' / 'Creating IPA for software ISP failed'",
+		      sc.pixelFormat.toString().c_str());
+		return err(Status::INTERNAL_ERROR);
+	}
+
+	ALOGI("流已配置：%zu 路，libcamera 源 %dx%d 输出 %s",
+	      halStreams_.size(), srcWidth_, srcHeight_,
+	      sc.pixelFormat.toString().c_str());
+	return ndk::ScopedAStatus::ok();
+}
+
+ndk::ScopedAStatus Session::configureStreamsV2(
+	const StreamConfiguration &cfg,
+	aidl::android::hardware::camera::device::ConfigureStreamsRet *out)
+{
+	return configureStreams(cfg, &out->halStreams);
+}
+
+ndk::ScopedAStatus Session::constructDefaultRequestSettings(RequestTemplate type,
+							    CameraMetadata *out)
+{
+	out->metadata = buildDefaultRequest(static_cast<int>(type), facts_);
+	return ndk::ScopedAStatus::ok();
+}
+
+ndk::ScopedAStatus Session::flush()
+{
+	/* 我们不排队积压请求，libcamera 自己会把在途的完成掉。 */
+	return ndk::ScopedAStatus::ok();
+}
+
+ndk::ScopedAStatus Session::isReconfigurationRequired(const CameraMetadata &,
+						      const CameraMetadata &, bool *out)
+{
+	*out = false;
+	return ndk::ScopedAStatus::ok();
+}
+
+ndk::ScopedAStatus Session::processCaptureRequest(const std::vector<CaptureRequest> &reqs,
+						  const std::vector<BufferCache> &cachesToRemove,
+						  int32_t *out)
+{
+	std::lock_guard<std::mutex> lk(mutex_);
+	dropCaches(cachesToRemove);
+	*out = 0;
+	if (!streaming_)
+		return err(Status::INTERNAL_ERROR);
+
+	for (const auto &r : reqs) {
+		if (r.outputBuffers.empty())
+			continue;
+		if (freeRequests_.empty()) {
+			/* ⚠️ 没有空闲请求就如实返回已接受的数量，让框架回压 ——
+			 *    悄悄丢帧会让上层等一个永远不来的结果。 */
+			ALOGW("无空闲请求，已接受 %d/%zu", *out, reqs.size());
+			break;
+		}
+		auto lreq = std::move(freeRequests_.front());
+		freeRequests_.pop_front();
+
+		lreq->reuse(libcamera::Request::ReuseBuffers);
+		libcamera::Request *key = lreq.get();
+		Pending p;
+		p.frameNumber = r.frameNumber;
+		/*
+		 * ★ 设置可能走 FMQ（fmqSettingsSize > 0 时 settings 字段是空的）——框架优先写队列。
+		 *   此前只读 settings 字段，于是绝大多数请求在我们眼里"没有设置"：结果里回显不了
+		 *   请求键，闪光/AE 模式也读不到。现在两条路都收。
+		 */
+		if (r.fmqSettingsSize > 0) {
+			p.settings.resize(static_cast<size_t>(r.fmqSettingsSize));
+			if (!requestQueue_->read(reinterpret_cast<int8_t *>(p.settings.data()),
+						 static_cast<size_t>(r.fmqSettingsSize))) {
+				ALOGE("从 FMQ 读请求设置失败（%lld 字节）", (long long)r.fmqSettingsSize);
+				p.settings.clear();
+			}
+		} else {
+			p.settings = r.settings.metadata;
+		}
+
+		/* ⚠️ 现在就导入每一路的缓冲：AIDL 的 StreamBuffer 不可拷贝
+		 *    （见 Session.h 的说明），而入参是 const&，move 不出来。 */
+		bool importOk = true;
+		for (const auto &ob : r.outputBuffers) {
+			int32_t w = 0, h = 0;
+			bool isBlob = false;
+			int32_t blobSize = 0;
+			for (const auto &hs : halStreams_)
+				if (hs.id == ob.streamId) {
+					w = hs.width; h = hs.height;
+					isBlob = hs.isBlob; blobSize = hs.blobSize;
+				}
+			if (!w || !h) {
+				ALOGE("请求里出现未配置的流 id=%d", ob.streamId);
+				importOk = false;
+				break;
+			}
+			buffer_handle_t hnd = getBuffer(ob);
+			if (!hnd) { importOk = false; break; }
+			p.buffers.push_back({ ob.streamId, ob.bufferId, hnd, w, h,
+					      isBlob, blobSize });
+		}
+		if (!importOk) {
+			/* ⚠️ 不要在这里 free：句柄归缓存所有，下一帧还要用。 */
+			freeRequests_.push_back(std::move(lreq));
+			break;
+		}
+
+		/* ── 闪光灯策略（见 Session.h 里的说明）── */
+		{
+			uint8_t trigger = ANDROID_CONTROL_AE_PRECAPTURE_TRIGGER_IDLE;
+			uint8_t intent = ANDROID_CONTROL_CAPTURE_INTENT_PREVIEW;
+			parseFlashControls(p.settings, &trigger, &intent);
+			if (!flashLed_.empty()) {
+				bool hasBlob = false;
+				for (const auto &b : p.buffers)
+					hasBlob = hasBlob || b.isBlob;
+				const bool torch = flashMode_ == ANDROID_FLASH_MODE_TORCH;
+				/* "暗" = 画面均值低，或 AGC 已把模拟增益推到 kDarkGain 以上（后者更可靠：
+				 * AGC 会把能救的场景拉亮，增益高就是它在硬撑）。 */
+				const bool dark = lastLuma_ < kDarkLuma || lastGain_ >= kDarkGain;
+				const bool flashAe =
+					aeMode_ == ANDROID_CONTROL_AE_MODE_ON_ALWAYS_FLASH ||
+					(aeMode_ == ANDROID_CONTROL_AE_MODE_ON_AUTO_FLASH && dark);
+				if (trigger == ANDROID_CONTROL_AE_PRECAPTURE_TRIGGER_START) {
+					flashArmed_ = flashAe;
+					precaptureActive_ = true;
+					precaptureFrames_ = 0;
+					lumaStable_ = 0;
+				} else if (trigger == ANDROID_CONTROL_AE_PRECAPTURE_TRIGGER_CANCEL) {
+					flashArmed_ = false;
+					precaptureActive_ = false;
+				}
+				const bool still = hasBlob ||
+						   intent == ANDROID_CONTROL_CAPTURE_INTENT_STILL_CAPTURE ||
+						   flashMode_ == ANDROID_FLASH_MODE_SINGLE;
+				const bool fire = torch || (flashAe && (flashArmed_ || still));
+				if (fire) {
+					setLed(true);
+					firedPending_++;
+				} else if (firedPending_ == 0) {
+					setLed(false);
+				}
+				p.flashFired = fire;
+				p.endsFlash = flashArmed_ && still && !torch;
+				/*
+				 * 预闪收敛：灯是在这个请求点亮的，而在途的几帧还是没灯的曝光；等 libcamera 的
+				 * AGC 在灯光下重新收敛（亮度连续 2 帧变化 < kLumaStableDelta）再报 CONVERGED，
+				 * 应用才按快门。至少 kPrecaptureMin 帧兜住排队深度，最多 kPrecaptureMax 帧兜住不收敛。
+				 */
+				if (precaptureActive_) {
+					precaptureFrames_++;
+					if ((precaptureFrames_ >= kPrecaptureMin && lumaStable_ >= 2) ||
+					    precaptureFrames_ >= kPrecaptureMax)
+						precaptureActive_ = false;
+				}
+				if (precaptureActive_) {
+					p.aeState = ANDROID_CONTROL_AE_STATE_PRECAPTURE;
+				} else if (aeMode_ == ANDROID_CONTROL_AE_MODE_ON_AUTO_FLASH && dark &&
+					   !fire) {
+					p.aeState = ANDROID_CONTROL_AE_STATE_FLASH_REQUIRED;
+				} else {
+					p.aeState = ANDROID_CONTROL_AE_STATE_CONVERGED;
+				}
+			}
+			p.aeMode = aeMode_;
+			p.flashMode = flashMode_;
+		}
+
+		pending_[key] = std::move(p);
+
+		if (cam_->queueRequest(key)) {
+			ALOGE("queueRequest 失败 frame=%d", r.frameNumber);
+			pending_.erase(key);   /* 句柄归缓存，不在这里释放 */
+			freeRequests_.push_back(std::move(lreq));
+			break;
+		}
+		/* libcamera 持有裸指针直到完成，所以这里放掉所有权，
+		 * 完成回调里再放回 freeRequests_。 */
+		lreq.release();
+		(*out)++;
+	}
+	return ndk::ScopedAStatus::ok();
+}
+
+ndk::ScopedAStatus Session::switchToOffline(
+	const std::vector<int32_t> &,
+	aidl::android::hardware::camera::device::CameraOfflineSessionInfo *,
+	std::shared_ptr<aidl::android::hardware::camera::device::ICameraOfflineSession> *out)
+{
+	*out = nullptr;
+	return err(Status::OPERATION_NOT_SUPPORTED);
+}
+
+ndk::ScopedAStatus Session::repeatingRequestEnd(int32_t, const std::vector<int32_t> &)
+{
+	return ndk::ScopedAStatus::ok();
+}
+
+ndk::ScopedAStatus Session::getCaptureRequestMetadataQueue(
+	::aidl::android::hardware::common::fmq::MQDescriptor<
+		int8_t, ::aidl::android::hardware::common::fmq::SynchronizedReadWrite> *out)
+{
+	*out = requestQueue_->dupeDesc();
+	return ndk::ScopedAStatus::ok();
+}
+
+ndk::ScopedAStatus Session::getCaptureResultMetadataQueue(
+	::aidl::android::hardware::common::fmq::MQDescriptor<
+		int8_t, ::aidl::android::hardware::common::fmq::SynchronizedReadWrite> *out)
+{
+	*out = resultQueue_->dupeDesc();
+	return ndk::ScopedAStatus::ok();
+}
+
+ndk::ScopedAStatus Session::signalStreamFlush(const std::vector<int32_t> &, int32_t)
+{
+	/* HAL buffer manager 关着（enableHalBufferManager=false），无事可做。 */
+	return ndk::ScopedAStatus::ok();
+}
+
+} /* namespace gaokun3 */
+
+/* ────────────────────────── 帧交付 ────────────────────────── */
+
+namespace gaokun3 {
+
+buffer_handle_t Session::getBuffer(const StreamBuffer &sb)
+{
+	const auto key = std::make_pair(sb.streamId, sb.bufferId);
+	auto it = bufferCache_.find(key);
+	if (it != bufferCache_.end())
+		return it->second;
+
+	/*
+	 * 第一次见到这个 bufferId —— 此时（且仅此时）框架给的句柄是有效的。
+	 * ★ StreamBuffer.aidl 原文："If the bufferId has been sent to the HAL
+	 *   before, this buffer handle must be empty and HAL must look up the
+	 *   actual buffer handle to use from its own bufferId to buffer handle map."
+	 */
+	const native_handle_t *raw = ::android::makeFromAidl(sb.buffer);
+	if (!raw) {
+		ALOGE("makeFromAidl 失败 stream=%d buffer=%lld", sb.streamId,
+		      (long long)sb.bufferId);
+		return nullptr;
+	}
+
+	/*
+	 * ⚠️★ 用 importBufferNoValidate()，不要用带宽高/格式/usage 的那个重载：
+	 *   gralloc4 会拿传进去的描述符跟缓冲【实际分配时】的参数比对，对不上
+	 *   返回 BAD_BUFFER(2)，而我们并不知道框架分配时用的确切 usage
+	 *   （producerUsage | consumerUsage 再加框架自己的位，我们只声明了一半）。
+	 *   ★ 判据：错误码 2 是 gralloc 的 BAD_BUFFER，不是 errno 的 ENOENT。
+	 */
+	auto &mapper = android::GraphicBufferMapper::get();
+	buffer_handle_t imported = nullptr;
+	android::status_t st = mapper.importBufferNoValidate(raw, &imported);
+	/*
+	 * ⚠️★ 只 delete、不 close：importBufferNoValidate() 成功后【接管了 fd】，
+	 *   再 native_handle_close() 会去关已经被接管/关闭的描述符，
+	 *   日志刷 "Could not close FD nn: Bad file descriptor"。
+	 *   失败时才要自己关掉，否则漏 fd。
+	 */
+	if (st != android::OK || !imported)
+		native_handle_close(const_cast<native_handle_t *>(raw));
+	native_handle_delete(const_cast<native_handle_t *>(raw));
+	if (st != android::OK || !imported) {
+		ALOGE("importBuffer 失败: %d (stream=%d buffer=%lld)", st,
+		      sb.streamId, (long long)sb.bufferId);
+		return nullptr;
+	}
+
+	bufferCache_[key] = imported;
+	return imported;
+}
+
+void Session::dropCaches(const std::vector<BufferCache> &caches)
+{
+	for (const auto &c : caches) {
+		auto it = bufferCache_.find(std::make_pair(c.streamId, c.bufferId));
+		if (it == bufferCache_.end())
+			continue;
+		android::GraphicBufferMapper::get().freeBuffer(it->second);
+		bufferCache_.erase(it);
+	}
+}
+
+void Session::dropAllCaches()
+{
+	for (auto &kv : bufferCache_)
+		android::GraphicBufferMapper::get().freeBuffer(kv.second);
+	bufferCache_.clear();
+}
+
+bool Session::deliver(const uint8_t *rgb, buffer_handle_t dst,
+		      int32_t dstW, int32_t dstH, int chromaBlur)
+{
+	const int srcStride = srcWidth_ * 3;
+
+	auto &mapper = android::GraphicBufferMapper::get();
+	android_ycbcr ycbcr = {};
+	android::status_t st = mapper.lockYCbCr(dst, GRALLOC_USAGE_SW_WRITE_OFTEN,
+						android::Rect(dstW, dstH), &ycbcr);
+	if (st != android::OK || !ycbcr.y) {
+		ALOGE("deliver: lockYCbCr 失败: %d", st);
+		return false;
+	}
+
+	bool ok = false;
+	const int cw = (dstW + 1) / 2, chh = (dstH + 1) / 2;
+	std::vector<uint8_t> i420(static_cast<size_t>(dstW) * dstH +
+				  static_cast<size_t>(cw) * chh * 2);
+	uint8_t *dy = i420.data();
+	uint8_t *du = dy + static_cast<size_t>(dstW) * dstH;
+	uint8_t *dv = du + static_cast<size_t>(cw) * chh;
+
+	/*
+	 * ★★ 用 J420（全范围）而不是 I420（限制范围 16–235）。
+	 *   Android 相机输出的 YUV_420_888 按约定是全范围 BT.601；
+	 *   给限制范围会让预览发灰发闷（对比度被压掉约 13%）。
+	 *   libyuv 的命名：I420 = 限制范围，J420 = 全范围（JPEG 范围）。
+	 *   ⚠️ 这一条是【假说】，靠前后截图 A/B 验证，不是从文档抄来的。
+	 *   字节序照旧：convert.h:959 注释明写 "RGB little endian (bgr in
+	 *   memory) to J420"，与 libcamera 的 RGB888(=BGR24) 对得上。
+	 */
+	int rc;
+	if (dstW == srcWidth_ && dstH == srcHeight_) {
+		rc = libyuv::RGB24ToJ420(rgb, srcStride, dy, dstW, du, cw, dv, cw,
+					 dstW, dstH);
+	} else {
+		/*
+		 * 需要缩放：先在源尺寸上转成 I420，再缩放到目标尺寸。
+		 * ⚠️ 顺序不能反 —— libyuv 没有"RGB24 直接缩放到 I420"的接口，
+		 *    而先缩放 RGB 再转会多搬一次 3 字节/像素的数据。
+		 * ⬜ 这条路每帧多一次全图拷贝；多路预览时值得再优化。
+		 */
+		const int scw = (srcWidth_ + 1) / 2, schh = (srcHeight_ + 1) / 2;
+		std::vector<uint8_t> src(static_cast<size_t>(srcWidth_) * srcHeight_ +
+					 static_cast<size_t>(scw) * schh * 2);
+		uint8_t *sy = src.data();
+		uint8_t *su = sy + static_cast<size_t>(srcWidth_) * srcHeight_;
+		uint8_t *sv = su + static_cast<size_t>(scw) * schh;
+		rc = libyuv::RGB24ToJ420(rgb, srcStride, sy, srcWidth_, su, scw, sv, scw,
+					 srcWidth_, srcHeight_);
+		if (rc == 0)
+			rc = libyuv::I420Scale(sy, srcWidth_, su, scw, sv, scw,
+					       srcWidth_, srcHeight_,
+					       dy, dstW, du, cw, dv, cw,
+					       dstW, dstH, libyuv::kFilterBilinear);
+	}
+
+	if (rc == 0 && chromaBlur > 0) {
+		/* 色度降噪：U/V 只有 1/4 分辨率，盒式模糊几乎免费，而彩色噪点正是最难看的那种。 */
+		boxBlurPlane(du, cw, chh, cw, chromaBlur);
+		boxBlurPlane(dv, cw, chh, cw, chromaBlur);
+	}
+
+	if (rc == 0) {
+		for (int y = 0; y < dstH; y++)
+			memcpy(static_cast<uint8_t *>(ycbcr.y) + y * ycbcr.ystride,
+			       dy + static_cast<size_t>(y) * dstW, dstW);
+		/* 按 chroma_step 同时支持平面(I420)与半平面(NV12/NV21)。 */
+		for (int y = 0; y < chh; y++) {
+			uint8_t *cb = static_cast<uint8_t *>(ycbcr.cb) + y * ycbcr.cstride;
+			uint8_t *cr = static_cast<uint8_t *>(ycbcr.cr) + y * ycbcr.cstride;
+			const uint8_t *su2 = du + static_cast<size_t>(y) * cw;
+			const uint8_t *sv2 = dv + static_cast<size_t>(y) * cw;
+			for (int x = 0; x < cw; x++) {
+				cb[x * ycbcr.chroma_step] = su2[x];
+				cr[x * ycbcr.chroma_step] = sv2[x];
+			}
+		}
+		ok = true;
+	} else {
+		ALOGE("deliver: 色彩转换/缩放失败 rc=%d", rc);
+	}
+
+	mapper.unlock(dst);
+	return ok;
+}
+
+/*
+ * 把一帧 RGB 编成 JPEG 写进 Android 的 BLOB 缓冲。
+ *
+ * ★ Android 的约定（`CameraBlob.aidl` / `CameraBlobId.aidl`）：
+ *   JPEG 数据从缓冲开头写，**缓冲末尾**放一个 8 字节的
+ *   `CameraBlob{ blobId = JPEG(0x00FF), blobSizeBytes }`。
+ *   框架按这个结构去找真实长度 —— 少了它，图片会被当成整个缓冲那么大。
+ *
+ * ⚠️ libcamera 给的是 B,G,R 顺序（formats::RGB888 → V4L2_PIX_FMT_BGR24，
+ *    见 formats.cpp:185），而 libjpeg 的 JCS_EXT_BGR 正好对应它 ——
+ *    用 JCS_RGB 会红蓝互换，而且不报任何错。
+ */
+bool Session::deliverJpeg(const uint8_t *rgb, buffer_handle_t dst,
+			  int32_t dstW, int32_t dstH, int32_t blobSize, int quality)
+{
+	auto &mapper = android::GraphicBufferMapper::get();
+	void *raw = nullptr;
+	android::status_t st = mapper.lock(dst, GRALLOC_USAGE_SW_WRITE_OFTEN,
+					   android::Rect(blobSize, 1), &raw);
+	if (st != android::OK || !raw) {
+		ALOGE("deliverJpeg: lock 失败: %d", st);
+		return false;
+	}
+
+	/*
+	 * 源尺寸与目标不同的话先缩放。
+	 * ⚠️ libyuv **没有** RGBScale（我一开始想当然写了，编译器拦下）。
+	 *    走 RGB24 → ARGB → ARGBScale 这条：libyuv 的 "ARGB" 在内存里是
+	 *    B,G,R,A，正好对上 libjpeg 的 JCS_EXT_BGRA，不用再转回 3 通道。
+	 */
+	std::vector<uint8_t> scaled;
+	const uint8_t *src = rgb;
+	int srcStride = srcWidth_ * 3;
+	int components = 3;
+	J_COLOR_SPACE colorSpace = JCS_EXT_BGR;   /* ★ 字节序见上面的说明 */
+
+	if (dstW != srcWidth_ || dstH != srcHeight_) {
+		std::vector<uint8_t> argbSrc(static_cast<size_t>(srcWidth_) * srcHeight_ * 4);
+		if (libyuv::RGB24ToARGB(rgb, srcStride, argbSrc.data(), srcWidth_ * 4,
+					srcWidth_, srcHeight_) != 0) {
+			ALOGE("deliverJpeg: RGB24ToARGB 失败");
+			mapper.unlock(dst);
+			return false;
+		}
+		scaled.resize(static_cast<size_t>(dstW) * dstH * 4);
+		if (libyuv::ARGBScale(argbSrc.data(), srcWidth_ * 4, srcWidth_, srcHeight_,
+				      scaled.data(), dstW * 4, dstW, dstH,
+				      libyuv::kFilterBilinear) != 0) {
+			ALOGE("deliverJpeg: ARGBScale 失败");
+			mapper.unlock(dst);
+			return false;
+		}
+		src = scaled.data();
+		srcStride = dstW * 4;
+		components = 4;
+		colorSpace = JCS_EXT_BGRA;
+	}
+
+	struct jpeg_compress_struct cinfo;
+	struct jpeg_error_mgr jerr;
+	cinfo.err = jpeg_std_error(&jerr);
+	jpeg_create_compress(&cinfo);
+
+	/* 直接写进 gralloc 缓冲；留出末尾 8 字节给 CameraBlob。 */
+	const size_t maxJpeg = static_cast<size_t>(blobSize) - sizeof(CameraBlob);
+	unsigned char *out = static_cast<unsigned char *>(raw);
+	unsigned long outSize = maxJpeg;
+	jpeg_mem_dest(&cinfo, &out, &outSize);
+
+	cinfo.image_width = dstW;
+	cinfo.image_height = dstH;
+	cinfo.input_components = components;
+	cinfo.in_color_space = colorSpace;
+	jpeg_set_defaults(&cinfo);
+	jpeg_set_quality(&cinfo, quality, TRUE);
+	jpeg_start_compress(&cinfo, TRUE);
+	while (cinfo.next_scanline < cinfo.image_height) {
+		JSAMPROW row = const_cast<JSAMPROW>(
+			src + static_cast<size_t>(cinfo.next_scanline) * srcStride);
+		jpeg_write_scanlines(&cinfo, &row, 1);
+	}
+	jpeg_finish_compress(&cinfo);
+	const size_t jpegLen = outSize;
+	jpeg_destroy_compress(&cinfo);
+
+	bool ok = false;
+	if (jpegLen > 0 && jpegLen <= maxJpeg) {
+		/* jpeg_mem_dest 可能自己 malloc 了新缓冲（超出我们给的大小时），
+		 * 那种情况下 out 不再指向 gralloc，要拷回去。 */
+		if (out != raw)
+			memcpy(raw, out, jpegLen);
+		CameraBlob blob;
+		blob.blobId = CameraBlobId::JPEG;
+		blob.blobSizeBytes = static_cast<int32_t>(jpegLen);
+		memcpy(static_cast<uint8_t *>(raw) + blobSize - sizeof(CameraBlob),
+		       &blob, sizeof(CameraBlob));
+		ok = true;
+		ALOGD("JPEG %dx%d 质量%d → %zu 字节", dstW, dstH, quality, jpegLen);
+	} else {
+		ALOGE("deliverJpeg: JPEG 长度异常 %zu（上限 %zu）", jpegLen, maxJpeg);
+	}
+	if (out != raw)
+		free(out);
+
+	mapper.unlock(dst);
+	return ok;
+}
+
+int Session::denoiseThreshold() const
+{
+	/* 调用方不持锁也没关系：lastGain_ 是个 double，读到旧值只是差一帧的强度。 */
+	if (lastGain_ < kDenoiseGain)
+		return 0;
+	return std::clamp(static_cast<int>(lastGain_ * 3.0), 6, 36);
+}
+
+int Session::chromaBlurRadius() const
+{
+	if (lastGain_ < kDenoiseGain)
+		return 0;
+	return lastGain_ < 5.0 ? 1 : 2;
+}
+
+/*
+ * 3×3 ε 滤波：只把与中心像素相差 ≤ T 的邻居算进平均 —— 平掉噪声、保住边缘（边缘两侧差值大于 T，
+ * 不会被平均进来）。按行切给 4 个线程；13 MP 单线程约 1 秒，四线程约 0.3 秒，静态照片能接受。
+ */
+void Session::epsilonFilterRgb(const uint8_t *src, uint8_t *dst, int w, int h, int threshold)
+{
+	auto work = [=](int y0, int y1) {
+		for (int y = y0; y < y1; y++) {
+			const int ym = y > 0 ? y - 1 : y;
+			const int yp = y < h - 1 ? y + 1 : y;
+			const uint8_t *r0 = src + static_cast<size_t>(ym) * w * 3;
+			const uint8_t *r1 = src + static_cast<size_t>(y) * w * 3;
+			const uint8_t *r2 = src + static_cast<size_t>(yp) * w * 3;
+			uint8_t *out = dst + static_cast<size_t>(y) * w * 3;
+			for (int x = 0; x < w; x++) {
+				const int xm = (x > 0 ? x - 1 : x) * 3;
+				const int x0 = x * 3;
+				const int xp = (x < w - 1 ? x + 1 : x) * 3;
+				for (int c = 0; c < 3; c++) {
+					const int center = r1[x0 + c];
+					int sum = center, n = 1;
+					const int nb[8] = { r0[xm + c], r0[x0 + c], r0[xp + c],
+							    r1[xm + c],             r1[xp + c],
+							    r2[xm + c], r2[x0 + c], r2[xp + c] };
+					for (int v : nb) {
+						if (std::abs(v - center) <= threshold) {
+							sum += v;
+							n++;
+						}
+					}
+					out[x0 + c] = static_cast<uint8_t>((sum + n / 2) / n);
+				}
+			}
+		}
+	};
+	const int nthreads = std::clamp(h / 256, 1, 4);
+	std::vector<std::thread> pool;
+	for (int t = 0; t < nthreads; t++) {
+		const int y0 = h * t / nthreads, y1 = h * (t + 1) / nthreads;
+		pool.emplace_back(work, y0, y1);
+	}
+	for (auto &t : pool)
+		t.join();
+}
+
+/* 可分离盒式模糊（先横后纵），半径 radius，边界夹紧。用在 1/4 分辩率的色度平面上。 */
+void Session::boxBlurPlane(uint8_t *plane, int w, int h, int stride, int radius)
+{
+	if (radius <= 0 || w <= 0 || h <= 0)
+		return;
+	std::vector<uint8_t> tmp(static_cast<size_t>(w) * h);
+	const int win = 2 * radius + 1;
+	for (int y = 0; y < h; y++) {
+		const uint8_t *row = plane + static_cast<size_t>(y) * stride;
+		uint8_t *out = tmp.data() + static_cast<size_t>(y) * w;
+		for (int x = 0; x < w; x++) {
+			int sum = 0;
+			for (int k = -radius; k <= radius; k++)
+				sum += row[std::clamp(x + k, 0, w - 1)];
+			out[x] = static_cast<uint8_t>((sum + win / 2) / win);
+		}
+	}
+	for (int x = 0; x < w; x++) {
+		for (int y = 0; y < h; y++) {
+			int sum = 0;
+			for (int k = -radius; k <= radius; k++)
+				sum += tmp[static_cast<size_t>(std::clamp(y + k, 0, h - 1)) * w + x];
+			plane[static_cast<size_t>(y) * stride + x] = static_cast<uint8_t>((sum + win / 2) / win);
+		}
+	}
+}
+
+void Session::onRequestCompleted(libcamera::Request *req)
+{
+	if (req->status() == libcamera::Request::RequestCancelled)
+		return;
+
+	Pending pend;
+	{
+		std::lock_guard<std::mutex> lk(mutex_);
+		auto it = pending_.find(req);
+		if (it == pending_.end()) {
+			ALOGW("完成了一个不认识的请求 %p", (void *)req);
+			return;
+		}
+		pend = std::move(it->second);
+		pending_.erase(it);
+	}
+
+	/*
+	 * ⚠️★★ 请求【不能】在这里就还回空闲池 —— 下面还要读 req->buffers()。
+	 *   还回去之后 processCaptureRequest 可能立刻取走并 reuse()，
+	 *   于是我们读到的是一个已经被复用的对象。实测就是这样崩的
+	 *   （tid name=CameraManager，栈顶 onRequestCompleted+1428）。
+	 *   ★ 归还所有权和"用完它"是两件事，顺序不能图省事。
+	 *   现在改成在函数最后才归还。
+	 */
+	if (req->buffers().empty()) {
+		ALOGE("完成的请求里没有 buffer");
+		std::lock_guard<std::mutex> lk(mutex_);
+		freeRequests_.push_back(std::unique_ptr<libcamera::Request>(req));
+		return;
+	}
+	const libcamera::FrameBuffer *fb = req->buffers().begin()->second;
+	const int64_t timestamp = fb->metadata().timestamp;
+
+	/* mmap 一次，分发给所有流。 */
+	const auto &planes = fb->planes();
+	const uint8_t *rgb = nullptr;
+	void *srcMap = MAP_FAILED;
+	size_t srcLen = 0;
+	if (!planes.empty()) {
+		srcLen = planes[0].offset + planes[0].length;
+		srcMap = mmap(nullptr, srcLen, PROT_READ, MAP_SHARED,
+			      planes[0].fd.get(), 0);
+		if (srcMap != MAP_FAILED)
+			rgb = static_cast<const uint8_t *>(srcMap) + planes[0].offset;
+		else
+			ALOGE("mmap libcamera 帧失败: %s", strerror(errno));
+		/* 第二道保险（#109）：帧不够 RGB24 的尺寸就整帧报 ERROR_BUFFER，绝不越界读。 */
+		if (rgb && planes[0].length < static_cast<size_t>(srcWidth_) * srcHeight_ * 3) {
+			ALOGE("libcamera 帧只有 %zu 字节，不够 %dx%d 的 RGB24 —— 丢弃这一帧",
+			      static_cast<size_t>(planes[0].length), srcWidth_, srcHeight_);
+			rgb = nullptr;
+		}
+	}
+
+	/* 采样平均亮度（每 16 行 × 每 16 列），给 AUTO 闪光当"太暗"判据。软件 ISP 的 IPA
+	 * 不往结果元数据里写曝光/增益，这是我们唯一现成的亮度信号。 */
+	if (rgb) {
+		uint64_t sum = 0;
+		uint32_t n = 0;
+		for (int y = 0; y < srcHeight_; y += 16) {
+			const uint8_t *px = rgb + static_cast<size_t>(y) * srcWidth_ * 3;
+			for (int x = 0; x < srcWidth_; x += 16, px += 48) {
+				sum += px[0] + 2u * px[1] + px[2];
+				n++;
+			}
+		}
+		if (n) {
+			const int luma = static_cast<int>(sum / (4ull * n));
+			std::lock_guard<std::mutex> lk(mutex_);
+			lumaStable_ = (std::abs(luma - lastLuma_) < kLumaStableDelta) ? lumaStable_ + 1 : 0;
+			lastLuma_ = luma;
+		}
+	}
+
+	/* libcamera（libipa 的 Agc::fillMetadata）每帧报实际曝光与模拟增益：回填结果、驱动降噪强度与闪光判据。 */
+	int64_t exposureNs = 0;
+	int32_t sensitivity = 0;
+	{
+		const libcamera::ControlList &md = req->metadata();
+		auto gain = md.get(libcamera::controls::AnalogueGain);
+		auto expo = md.get(libcamera::controls::ExposureTime);
+		std::lock_guard<std::mutex> lk(mutex_);
+		if (gain && *gain > 0)
+			lastGain_ = *gain;
+		if (expo && *expo > 0)
+			lastExposureUs_ = *expo;
+		if (gain)
+			sensitivity = static_cast<int32_t>(*gain * 100.0f + 0.5f);
+		if (expo)
+			exposureNs = static_cast<int64_t>(*expo) * 1000;
+	}
+
+	/* 降噪：静态照片走 RGB ε 滤波（有 BLOB 流且增益够高才算，13 MP 不便宜）；预览只模糊色度。 */
+	const int denoiseT = denoiseThreshold();
+	const int chromaBlur = chromaBlurRadius();
+	std::vector<uint8_t> denoised;
+	const uint8_t *rgbStill = rgb;
+	if (rgb && denoiseT > 0) {
+		bool hasBlob = false;
+		for (const auto &pb : pend.buffers)
+			hasBlob = hasBlob || pb.isBlob;
+		if (hasBlob) {
+			denoised.resize(static_cast<size_t>(srcWidth_) * srcHeight_ * 3);
+			epsilonFilterRgb(rgb, denoised.data(), srcWidth_, srcHeight_, denoiseT);
+			rgbStill = denoised.data();
+			ALOGD("静态照片降噪：增益 %.2f → ε=%d", lastGain_, denoiseT);
+		}
+	}
+
+	/* ── 顺序要求：先 shutter，后结果 ── */
+	NotifyMsg msg;
+	ShutterMsg shutter;
+	shutter.frameNumber = pend.frameNumber;
+	shutter.timestamp = timestamp;
+	shutter.readoutTimestamp = timestamp;
+	msg.set<NotifyMsg::Tag::shutter>(shutter);
+	std::vector<NotifyMsg> msgs;
+	msgs.push_back(std::move(msg));
+	cb_->notify(msgs);
+
+	std::vector<bool> okv;
+	for (auto &pb : pend.buffers) {
+		bool ok = rgb && (pb.isBlob
+				  ? deliverJpeg(rgbStill, pb.handle, pb.width, pb.height,
+						pb.blobSize, /*quality=*/90)
+				  : deliver(rgb, pb.handle, pb.width, pb.height, chromaBlur));
+		okv.push_back(ok);
+		if (!ok) {
+			NotifyMsg emsg;
+			ErrorMsg e;
+			e.frameNumber = pend.frameNumber;
+			e.errorStreamId = pb.streamId;
+			e.errorCode = ErrorCode::ERROR_BUFFER;
+			emsg.set<NotifyMsg::Tag::error>(e);
+			std::vector<NotifyMsg> emsgs;
+			emsgs.push_back(std::move(emsg));
+			cb_->notify(emsgs);
+		}
+	}
+	if (srcMap != MAP_FAILED)
+		munmap(srcMap, srcLen);
+
+	CaptureResult result;
+	result.frameNumber = pend.frameNumber;
+	result.fmqResultSize = 0;
+	result.partialResult = 1;
+	/* ⬜ 之后应把 libcamera 的实际曝光/增益也填回去（软件 ISP 的 IPA 目前不报）。 */
+	FrameResultFacts fr;
+	fr.flashState = flashLed_.empty() ? ANDROID_FLASH_STATE_UNAVAILABLE
+			: (pend.flashFired ? ANDROID_FLASH_STATE_FIRED : ANDROID_FLASH_STATE_READY);
+	fr.aeState = pend.aeState;
+	fr.aeMode = pend.aeMode;
+	fr.flashMode = pend.flashMode;
+	fr.exposureNs = exposureNs;
+	fr.sensitivity = sensitivity;
+	result.result.metadata = buildResult(pend.settings, timestamp, /*pipelineDepth=*/4, fr);
+
+	for (size_t i = 0; i < pend.buffers.size(); i++) {
+		StreamBuffer sb;
+		sb.streamId = pend.buffers[i].streamId;
+		sb.bufferId = pend.buffers[i].bufferId;
+		sb.status = okv[i] ? BufferStatus::OK : BufferStatus::ERROR;
+		/* ⚠️ buffer/fence 都留空：框架按 bufferId 认，
+		 *    回传句柄会被当成一次新导入。 */
+		result.outputBuffers.push_back(std::move(sb));
+	}
+	result.inputBuffer.streamId = -1;
+	result.inputBuffer.bufferId = 0;
+
+	std::vector<CaptureResult> results;
+	results.push_back(std::move(result));
+	cb_->processCaptureResult(results);
+
+	/* 到这里才用完 req，可以还回空闲池了（见上面的说明）。 */
+	{
+		std::lock_guard<std::mutex> lk(mutex_);
+		freeRequests_.push_back(std::unique_ptr<libcamera::Request>(req));
+		/* 闪光灯：点过灯的请求都完成了、而且没人还要灯，才灭。 */
+		if (pend.endsFlash)
+			flashArmed_ = false;
+		if (pend.flashFired && --firedPending_ == 0 && !flashArmed_ &&
+		    flashMode_ != ANDROID_FLASH_MODE_TORCH)
+			setLed(false);
+	}
+}
+
+} /* namespace gaokun3 */

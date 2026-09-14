@@ -41,6 +41,9 @@
       the manifest committed in this repository. Keeping the placeholder rather
       than hardcoding the filename means a second device would work unchanged.
     -->
+    <!-- ⚠️ 2026-09-14 试过切到 raw.githubusercontent.com，又改回来了：GitHub（raw 与 release-assets）在国内
+         不可达/极慢，v0.6.0 一发就有用户反馈更新失败。释放 R2 桶的前提是先有一个国内可达的镜像
+         （例如同一 Cloudflare 域名下的 Worker 反代 GitHub Release 附件），清单与下载地址都要过它。-->
     <string name="updater_server_url" translatable="false">https://ota.072172.xyz/ota/{device}.json</string>
 
     <!--

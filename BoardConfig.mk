@@ -292,3 +292,13 @@ TARGET_KERNEL_SOURCE :=
 -include vendor/gapps/arm64/BoardConfigVendor.mk
 
 include vendor/lineage/config/BoardConfigLineage.mk
+
+# WayDroid-ATV Mesa (lineage-18.1): Make/meson cross build provides
+# /vendor/lib{64}/hw/vulkan.freedreno.so. Android 16 allows the external/
+# Android.mk through vendor/extra/build/androidmk/allowlist.txt.
+BOARD_MESA3D_USES_MESON_BUILD := true
+BOARD_MESA3D_GALLIUM_DRIVERS := freedreno
+BOARD_MESA3D_VULKAN_DRIVERS := freedreno
+BOARD_MESA3D_GALLIUM_VA := disabled
+BOARD_MESA3D_VIDEO_CODECS := all_free
+BOARD_MESA3D_MESON_ARGS := -Dallow-kcmp=enabled

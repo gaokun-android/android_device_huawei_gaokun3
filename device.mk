@@ -402,14 +402,17 @@ PRODUCT_COPY_FILES += \
     $(LOCAL_PATH)/firmware/qca/wcnhpnv21g.bin:ramdisk/lib/firmware/qca/wcnhpnv21g.bin
 
 # ─── Stage 5 Phase B: 硬件 Vulkan（turnip / freedreno on 主线 msm DRM）───
-# external/mesa3d 是 WayDroid-ATV 的 Mesa 26.1.8（lineage-18.1），
-# android/Android.mk 用 meson 交叉构建，直接安装 /vendor/lib{64}/hw/vulkan.freedreno.so。
-# 构建变量见 BoardConfig.mk；Android 16 的 external/ Android.mk 封锁由
-# vendor/extra/build/androidmk/allowlist.txt 放行。Mesa 源码不做本地修改。
+# 构建流程见 docs/stage5-freedreno.md：
+#   1. scripts/mesa-tool-fixes.py     补 meson_to_hermetic 与 mesa 25.3 的 API 落差
+#   2. 生成器 + scripts/mesa-bp-merge.py 产出 external/mesa3d/Android.bp
+#   3. mesa/turnip-shared.bp.in       把静态库包成 Android Vulkan HAL 共享库
 # GLES 仍由 ANGLE 提供，但它的 Vulkan 后端从此跑在 Adreno 690 上而不是 SwiftShader。
 # ⚠️ GPU 需要 zap shader 固件 qcdxkmsuc8280.mbn（见上面的固件双路安装），
 #    缺了它 GPU 停在安全模式，adreno probe 会失败。
 # Stage 6 M3（2026-08-19）：管线已在 crDroid 树上跑通并打开。
+# crDroid 的 external/mesa3d 与 Stage 5 打补丁那棵是【同一个 commit】
+# （d4b6f1eba289… @ android-16.0.0_r4，mesa 25.3.0-devel），
+# 所以 Stage 5 的补丁树逐字可套，不需要重新对齐生成管线。
 PRODUCT_PACKAGES += \
     vulkan.freedreno
 
